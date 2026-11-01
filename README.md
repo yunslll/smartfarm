@@ -1,5 +1,5 @@
-# smartfarm
-App->server control, contribute.
+//# smartfarm//
+
 
 #include <WiFiS3.h>     // 우노 R4 WiFi 전용 라이브러리
 #include <DHT.h>
