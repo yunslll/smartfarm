@@ -37,9 +37,9 @@ class SmartFarmManager: NSObject, ObservableObject, CocoaMQTTDelegate {
     
     private func setupMQTT() {
         let clientID = "iPhone_SmartFarm_App_" + String(Int.random(in: 1000...9999))
-        mqtt = CocoaMQTT(clientID: clientID, host: "136.114.86.246", port: 1883)
-        mqtt?.username = "manaphy1"
-        mqtt?.password = "dbrlshd126!"
+        mqtt = CocoaMQTT(clientID: clientID, host: //"   "//, port: //  //)
+        mqtt?.username = //"  "//
+        mqtt?.password = //"  "//
         mqtt?.keepAlive = 60
         
         // 자동 재연결 및 소켓 설정
