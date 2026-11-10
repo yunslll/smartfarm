@@ -1,0 +1,482 @@
+import SwiftUI
+import Combine
+import CocoaMQTT
+
+// ==========================================
+// 1. 스마트팜 통신 및 데이터 관리 매니저
+// ==========================================
+class SmartFarmManager: NSObject, ObservableObject {
+    
+    @Published var isConnected: Bool = false
+    
+    var mqtt: CocoaMQTT?
+    
+    // UI 상태 변수
+    @Published var currentTemp: Double = 31.0
+    @Published var currentHumidity: Double = 40.0
+    @Published var soilTemp: Double = 50.0
+    @Published var soilHumidity: Double = 50.0
+    @Published var isWatering: Bool = false
+    @Published var isAutoMode: Bool = true
+    @Published var selectedWateringMinutes: Int = 10
+    
+    @Published var highTempThreshold: Int = 30
+    @Published var lowTempThreshold: Int = -10
+    @Published var isFan: Bool = false
+    @Published var isFanAutoMode: Bool = true
+    @Published var selectedFanMinutes: Int = 30
+  
+    private var statusTimer: Timer?
+    
+    override init() {
+        super.init()
+#if DEBUG
+        if ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1" { return }
+#endif
+        setupMQTT()
+        setupAppLifecycleObservers()
+    }
+    
+    private func setupMQTT() {
+        let clientID = "iPhone_SmartFarm_App_" + String(Int.random(in: 1000...9999))
+        mqtt = CocoaMQTT(clientID: clientID, host: "127.0.0.0", port: 1880)
+        mqtt?.username = "Admin"
+        mqtt?.password = "1111"
+        mqtt?.keepAlive = 60
+        mqtt?.autoReconnect = true
+        mqtt?.autoReconnectTimeInterval = 5
+        mqtt?.allowUntrustCACertificate = true
+        mqtt?.delegate = self
+        
+        connectMQTT()
+    }
+    
+    func connectMQTT() {
+        guard let mqtt = mqtt else { return }
+        if mqtt.connState != .connected {
+            _ = mqtt.connect()
+        }
+    }
+    
+    // MARK: - App Lifecycle
+    private func setupAppLifecycleObservers() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+    }
+    
+    @objc private func appDidEnterBackground() {
+        print("앱이 백그라운드로 전환됨: 타이머 정지")
+        stopStatusPolling()
+    }
+    
+    @objc private func appWillEnterForeground() {
+        print("앱이 포그라운드로 복귀함: 연결 확인 및 상태 요청")
+        if mqtt?.connState == .connected {
+            sendCommand("STATUS_REQ")
+            startStatusPolling()
+        } else {
+            connectMQTT()
+        }
+    }
+    
+    deinit {
+        stopStatusPolling()
+        NotificationCenter.default.removeObserver(self)
+    }
+    
+    // MARK: - Polling & Commands
+    func startStatusPolling() {
+        stopStatusPolling()
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.isConnected else { return }
+            self.sendCommand("STATUS_REQ")
+        }
+    }
+
+    func stopStatusPolling() {
+        statusTimer?.invalidate()
+        statusTimer = nil
+    }
+    
+    func sendCommand(_ command: String) {
+        if mqtt?.connState != .connected {
+            connectMQTT()
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.mqtt?.publish("smartfarm/command", withString: command)
+            print("구글 서버로 관수 명령 전송: \(command)")
+        }
+    }
+    
+    // 팬 제어용 전용 메소드 추가
+    func sendFanCommand(_ command: String) {
+        if mqtt?.connState != .connected {
+            connectMQTT()
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.mqtt?.publish("smartfarm/fan/command", withString: command)
+            print("구글 서버로 팬 명령 전송: \(command)")
+        }
+    }
+    
+    // MARK: - JSON Parsing
+    func parseArduinoJSON(data: Data) {
+        struct ArduinoData: Codable {
+            let temp: Double?
+            let humidity: Double?
+            let soiltemp: Double?
+            let soilhumidity: Double?
+            let isWatering: Bool?
+            let isAutoMode: Bool?
+            let isFan: Bool?
+            let isFanAutoMode: Bool?
+        }
+        
+        do {
+            let decodedData = try JSONDecoder().decode(ArduinoData.self, from: data)
+            
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                
+                if let temp = decodedData.temp { self.currentTemp = temp }
+                if let humidity = decodedData.humidity { self.currentHumidity = humidity }
+                if let soiltemp = decodedData.soiltemp { self.soilTemp = soiltemp }
+                if let soilhumidity = decodedData.soilhumidity { self.soilHumidity = soilhumidity }
+                if let isWatering = decodedData.isWatering { self.isWatering = isWatering }
+                if let isAutoMode = decodedData.isAutoMode { self.isAutoMode = isAutoMode }
+                if let isFan = decodedData.isFan { self.isFan = isFan }
+                if let isFanAutoMode = decodedData.isFanAutoMode { self.isFanAutoMode = isFanAutoMode }
+                
+                let tempValue = Int(self.currentTemp)       // 공기 온도 경고 체크
+                if tempValue >= self.highTempThreshold {
+                    Notice.shared.sendTemperatureAlert(temp: tempValue, isHigh: true)
+                } else if tempValue <= self.lowTempThreshold {
+                    Notice.shared.sendTemperatureAlert(temp: tempValue, isHigh: false)
+                }
+            }
+        } catch {
+            if let jsonString = String(data: data, encoding: .utf8) {
+                print("JSON 파싱 실패 -> 수신 원본: \(jsonString)")
+            }
+            print("파싱 상세 에러: \(error)")
+        }
+    }
+}
+
+
+extension SmartFarmManager: CocoaMQTTDelegate {
+    
+    func mqtt(_ mqtt: CocoaMQTT, didConnectAck status: CocoaMQTTConnAck) {
+        if status == .accept {
+            print("구글 클라우드 MQTT 서버 연결 성공!")
+            mqtt.subscribe("smartfarm/status")
+            
+            DispatchQueue.main.async {
+                self.isConnected = true
+                self.sendCommand("STATUS_REQ") // 연결 즉시 상태 요청
+                self.startStatusPolling()      // 타이머 시작
+            }
+        }
+    }
+    
+    func mqtt(_ mqtt: CocoaMQTT, didReceiveMessage message: CocoaMQTTMessage, id: UInt16) {
+        if message.topic == "smartfarm/status" {
+            if let string = message.string,
+               let data = string.data(using: .utf8) {
+                self.parseArduinoJSON(data: data)
+            }
+        }
+    }
+    
+    func mqttDidDisconnect(_ mqtt: CocoaMQTT, withError err: Error?) {
+        print("MQTT 연결 해제됨: \(err?.localizedDescription ?? "알 수 없는 오류")")
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.stopStatusPolling() // 연결 해제 시 타이머 정지
+        }
+    }
+
+    func mqtt(_ mqtt: CocoaMQTT, didPublishMessage message: CocoaMQTTMessage, id: UInt16) {}
+    func mqtt(_ mqtt: CocoaMQTT, didPublishAck id: UInt16) {}
+    func mqtt(_ mqtt: CocoaMQTT, didSubscribeTopics success: NSDictionary, failed: [String]) {}
+    func mqtt(_ mqtt: CocoaMQTT, didSubscribeAck id: UInt16) {}
+    func mqtt(_ mqtt: CocoaMQTT, didUnsubscribeTopics topics: [String]) {}
+    func mqtt(_ mqtt: CocoaMQTT, didUnsubscribeTopic topic: String) {}
+    func mqtt(_ mqtt: CocoaMQTT, didUnsubscribeAck id: UInt16) {}
+    func mqttDidPing(_ mqtt: CocoaMQTT) {}
+    func mqttDidReceivePong(_ mqtt: CocoaMQTT) {}
+}
+
+// ==========================================
+// 2. 스마트폰 화면 UI 영역
+// ==========================================
+struct ConnectionStatusView: View {
+    let isConnected: Bool
+    let onReconnect: () -> Void
+    
+    var body: some View {
+        Button(action: {
+            if !isConnected {
+                onReconnect()
+            }
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: isConnected ? "wifi" : "wifi.slash")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(isConnected ? .green : .red)
+                
+                Text(isConnected ? "서버 연결됨" : "서버 연결 끊김 (터치하여 재연결)")
+                    .font(.caption)
+                    .bold()
+                    .foregroundColor(isConnected ? .green : .red)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(isConnected ? Color.green.opacity(0.15) : Color.red.opacity(0.15))
+            )
+        }
+        .disabled(isConnected)
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var farm = SmartFarmManager()
+    
+    var body: some View {
+        ZStack {
+            Color(red: 0.9, green: 0.98, blue: 0.9)
+                .ignoresSafeArea()
+            
+            ScrollView {
+                VStack(spacing: 20) {
+                    // 상단 타이틀 & 연결 상태
+                    VStack(spacing: 8) {
+                        Text("단비 포도농장")
+                            .font(.title)
+                            .bold()
+                            .foregroundStyle(.green)
+                        
+                        Text("Smart setting")
+                            .font(.subheadline)
+                            .foregroundStyle(.orange)
+                        
+                        ConnectionStatusView(isConnected: farm.isConnected) {
+                            farm.connectMQTT()
+                        }
+                        .padding(.top, 4)
+                    }
+                    .padding(.top, 20)
+                    
+                    // 토양 정보 상자 (변수 오타 수정)
+                    VStack(spacing: 10) {
+                        HStack {
+                            Image(systemName: "thermometer.sun")
+                                .foregroundStyle(.white)
+                            Text("현재 토양 밭 온도 : \(String(format: "%.1f", farm.soilTemp))°C")
+                                .font(.headline)
+                                .bold()
+                                .foregroundColor(.white)
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.brown.opacity(0.8))
+                        .cornerRadius(15)
+                        
+                        HStack {
+                            Image(systemName: "humidity")
+                                .foregroundStyle(.white)
+                            Text("현재 토양 밭 상대습도 : \(String(format: "%.1f", farm.soilHumidity))%")
+                                .font(.headline)
+                                .bold()
+                                .foregroundColor(.white)
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.blue.opacity(0.8))
+                        .cornerRadius(15)
+                    }
+                    .padding(.horizontal)
+                    
+                    // 공기 정보 상자
+                    VStack(spacing: 10) {
+                        HStack {
+                            Image(systemName: "thermometer.sun")
+                                .foregroundStyle(.orange)
+                            Text("현재 공기 중 밭 온도 : \(String(format: "%.1f", farm.currentTemp))°C")
+                                .font(.headline)
+                                .bold()
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.yellow.opacity(0.3))
+                        .cornerRadius(15)
+                        
+                        HStack {
+                            Image(systemName: "humidity")
+                                .foregroundStyle(.blue)
+                            Text("현재 공기 중 밭 상대습도 : \(String(format: "%.1f", farm.currentHumidity))%")
+                                .font(.headline)
+                                .bold()
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.blue.opacity(0.2))
+                        .cornerRadius(15)
+                    }
+                    .padding(.horizontal)
+                    
+                    // 모드 상태 표시
+                    VStack(spacing: 8) {
+                        HStack {
+                            Image(systemName: farm.isAutoMode ? "cpu.fill" : "hand.raised.fill")
+                            Text(farm.isAutoMode ? "자동 관수 제어 활성화" : "수동 관수 모드")
+                        }
+                        .font(.subheadline)
+                        .bold()
+                        .foregroundStyle(farm.isAutoMode ? .purple : .gray)
+                        
+                        if !farm.isAutoMode {
+                            Button(action: { farm.sendCommand("AUTO") }) {
+                                Text("자동 관수 제어 모드로 복귀하기")
+                                    .font(.caption)
+                                    .foregroundColor(.purple)
+                                    .underline()
+                            }
+                        }
+                        
+                        Divider()
+                            .padding(.vertical, 4)
+                        
+                        HStack {
+                            Image(systemName: farm.isFanAutoMode ? "cpu.fill" : "fanblades.fill")
+                            Text(farm.isFanAutoMode ? "자동 팬 제어 활성화" : "수동 팬 모드")
+                        }
+                        .font(.subheadline)
+                        .bold()
+                        .foregroundStyle(farm.isFanAutoMode ? .green : .gray)
+                        
+                        if !farm.isFanAutoMode {
+                            Button(action: { farm.sendFanCommand("AUTO") }) {
+                                Text("자동 팬 제어 모드로 복귀하기")
+                                    .font(.caption)
+                                    .foregroundColor(.purple)
+                                    .underline()
+                            }
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color.white.opacity(0.6))
+                    .cornerRadius(15)
+                    .padding(.horizontal)
+                    
+    // 제어 영역 (관수 및 환풍팬)
+        VStack(spacing: 16) {
+    // 1. 관수 제어 영역
+                VStack(spacing: 8) {
+                Button(action: {
+                    if farm.isWatering {
+                       farm.sendCommand("STOP")
+                    } else {
+                       farm.sendCommand("START:\(farm.selectedWateringMinutes)")
+                }
+                    }) {
+                    Text(farm.isWatering ? "물 주기 정지" : "\(farm.selectedWateringMinutes)분간 물 주기 시작")
+                        .font(.title3)
+                        .bold()
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .foregroundStyle(.white)
+                        .background(farm.isWatering ? Color.red : Color.blue)
+                        .cornerRadius(15)
+                }
+                            
+                    HStack {
+                     Text("관수 시간 선택:")
+                     .font(.subheadline)
+                     .bold()
+                     .foregroundColor(.secondary)
+                                                    
+                        Spacer()
+                                        
+                        Picker("관수 시간", selection: $farm.selectedWateringMinutes) {
+                        ForEach(1...60, id: \.self) { minute in
+                        Text("\(minute)분").tag(minute)
+                }
+            }
+                        .pickerStyle(.menu)
+                        .tint(.blue)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.white)
+                        .cornerRadius(10)
+                        .shadow(color: .black.opacity(0.05), radius: 2)
+                    }
+                }
+                                            
+                        Divider()
+                                            
+            // 2. 환풍팬 제어 영역
+                    VStack(spacing: 8) {
+                        Button(action: {
+                        if farm.isFan {
+                    farm.sendFanCommand("STOP")
+                } else {
+                    farm.sendFanCommand("START:\(farm.selectedFanMinutes)")
+            }
+                    }) {
+                        Text(farm.isFan ? "Fan 정지" : "\(farm.selectedFanMinutes)분간 Fan 작동")
+                                .font(.title3)
+                                .bold()
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .foregroundStyle(.white)
+                                .background(farm.isFan ? Color.red : Color.green)
+                                .cornerRadius(15)
+                             }
+                                        
+                                    HStack {
+                                    Text("Fan 시간 선택:")
+                                    .font(.subheadline)
+                                    .bold()
+                                    .foregroundColor(.secondary)
+                                                    
+                            Spacer()
+                                                    
+                                Picker("Fan 시간", selection: $farm.selectedFanMinutes) {
+                                ForEach(1...60, id: \.self) { minute in
+                                Text("\(minute)분").tag(minute)
+                            }
+                }
+                                .pickerStyle(.menu)
+            .tint(.green)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.white)
+                .cornerRadius(10)
+                .shadow(color: .black.opacity(0.05), radius: 2)
+                }
+            }
+        }
+                    .padding(.horizontal)
+                }
+                    .padding(.bottom, 20)
+            }
+        }
+    }
+}
